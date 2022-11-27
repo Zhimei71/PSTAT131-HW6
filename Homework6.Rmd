@@ -1,0 +1,267 @@
+---
+title: "Homework 6"
+author: "Zhimei_Chen"
+date: '2022-11-26'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(dbplyr)
+library(tidyverse) 
+library(RColorBrewer)
+library(ggplot2)
+library(ISLR)
+library(tidymodels)
+library(glmnet)
+library(rpart.plot)
+library(randomForest)
+library(vip)
+tidymodels_prefer()
+```
+
+#Exercise 1
+
+clean
+```{r,warning=FALSE}
+library(janitor)
+Pokemon <- read_csv("Pokemon.csv") %>%
+    clean_names()
+```
+
+find those not rare
+```{r}
+Pokemon %>% 
+  group_by(type_1) %>% 
+  summarise(n = n()) %>%
+  ggplot(aes(x = reorder(type_1, n), y = n)) +
+  geom_bar(stat = "identity", aes(fill = n)) +
+  coord_flip() +
+  geom_label(aes(label = n), size = 3) +
+  theme_test() +
+  labs(x = "Pokemon Type", y = "Frequency", title = "Bar plot")
+```
+
+filter
+```{r}
+Pokemon_n<-Pokemon %>%  
+  filter(type_1 %in% c("Bug", "Fire", "Grass", "Normal", "Water", "Psychic"))
+
+Pokemon_n$type_1<- as.factor(Pokemon_n$type_1)
+Pokemon_n$legendary<- as.factor(Pokemon_n$legendary)
+Pokemon_n$generation<- as.factor(Pokemon_n$generation)
+```
+
+split and v-fold (v=5)
+```{r}
+set.seed(3435)
+Pokemon_split <- initial_split(Pokemon_n, strata = "type_1",prop=0.75)
+
+Pokemon_train <- training(Pokemon_split)
+Pokemon_test <- testing(Pokemon_split)
+
+Pokemon_fold <- vfold_cv(Pokemon_train, v = 5,strata="type_1")
+```
+
+recipe
+```{r}
+recipe<-recipe(formula = type_1 ~ legendary + generation + sp_atk + attack + speed + defense + hp + sp_def, data = Pokemon_train) %>% 
+  step_dummy(c(legendary,generation)) %>% 
+  step_center(all_predictors()) %>% 
+  step_scale(all_predictors())
+```
+
+#Exercise 2
+```{r,warning=FALSE}
+library(corrplot)
+C = cor(Pokemon_train[6:11])
+corrplot.mixed(C, order = 'AOE')
+```
+The correlation coefficients are all positive, which means the relationships between each variables here are all positive. There are some stronger correlation between two of the variables, such as defense & sp_def, depense & attack, sp_def & hp, sp_def & attack, hp & attack, attack & sp_atk, sp_atk vs speed, where the strongest group here is defense & sp_def, the correlation coefficient between them is larger than 0.5.
+
+
+#Exercise 3
+
+workflow
+```{r}
+tree_spec <- decision_tree() %>%
+  set_engine("rpart")
+
+class_tree_spec <- tree_spec %>%
+  set_mode("classification")
+
+class_tree_wf <- workflow() %>%
+  add_model(class_tree_spec %>% set_args(cost_complexity = tune())) %>%
+  add_formula(type_1 ~ legendary + generation + hp + attack + defense + sp_atk + sp_def + speed)
+```
+
+tune & autoplot
+```{r}
+param_grid <- grid_regular(cost_complexity(range = c(-3, -1)), levels = 10)
+
+tune <- tune_grid(class_tree_wf, 
+                  resamples = Pokemon_fold, 
+                  grid = param_grid, 
+                  metrics = metric_set(roc_auc))
+autoplot(tune)
+```
+
+#Exercise 4
+```{r}
+tune %>% collect_metrics()
+
+tune %>%
+  collect_metrics()%>%
+  arrange(desc(mean))%>%
+  slice(1)
+```
+
+#Exercise 5 (1/2)
+rpart plot
+```{r,warning=FALSE}
+best_complexity <- select_best(tune, matric = 'roc_auc')
+class_tree_final <- finalize_workflow(class_tree_wf, best_complexity)
+class_tree_final_fit <- fit(class_tree_final, data = Pokemon_train)
+
+class_tree_final_fit %>%
+  extract_fit_engine() %>%
+  rpart.plot()
+```
+
+#Exercise 5 (2/2)
+
+```{r}
+forest_spec <- rand_forest() %>%
+  set_engine("ranger", importance = 'impurity')%>%
+  set_mode('classification')%>%
+  set_args(mtry=tune(),trees=tune(),min_n=tune())
+
+forest_wf<-workflow()%>%
+  add_model(forest_spec)%>%
+  add_recipe(recipe)
+```
+mtry: the number of predictor that randomly sampled at each split when creating tree model.
+trees: the number of trees included in our dataset.
+min_n: Minimum number of data points in a node required for further splitting of the node.
+
+```{r}
+grid<- grid_regular(mtry(range= c(1,8)),
+                          trees(range = c(200,1000)),
+                           min_n(range = c(5,20)),
+                          levels = 8)
+```
+mtry is the number of predictors that will be randomly sampled at each split when creating the tree model. There are only 8 predictors, so we can only have 1<=mtry<=8. 
+
+#Exercise 6
+```{r,warning=FALSE}
+library(ranger)
+tune_forest<-tune_grid(
+  forest_wf,
+  resamples=Pokemon_fold,
+  gird=grid,
+  metric=metric_set(roc_auc))
+
+autoplot(tune_forest)
+```
+According to the graph, as the number of randomly selected predictors (mtry) increases, the roc_auc value of most models tends to decrease.
+When (mtry = 7.5, trees = 1500, min_n = 30), it yield the best performance.
+
+#Exercise 7
+```{r}
+collect_metrics(tune_forest)%>%
+  arrange(-mean)
+```
+The best roc_auc in the random forest model is 0.7218696
+
+#Exercise 8
+```{r}
+best_forest<-select_best(tune_forest,metric = "roc_auc")
+forest_final<-finalize_workflow(forest_wf,best_forest)
+final_fit<-fit(forest_final,Pokemon_train)
+
+final_fit %>%
+  extract_fit_engine() %>%
+  vip()
+```
+"sp_atk" were most useful, and "Legendary" were least useful. These results are what I expect.
+
+#Exercise 9
+```{r}
+library(xgboost)
+boost_spec <- boost_tree(trees = tune(), tree_depth = 4) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+boost_wf <- workflow()%>%
+  add_model(boost_spec)%>%
+  add_recipe(recipe)
+
+grid2<- grid_regular(trees(range = c(10,2000) ),levels = 10)
+
+boost_tune_res <- tune_grid(
+  boost_wf, 
+  resamples = Pokemon_fold, 
+  grid = grid2, 
+  metrics = metric_set(roc_auc)
+)
+
+autoplot(boost_tune_res)
+```
+When the number of trees is less than about 750, the value of roc_auc increases. The value of roc_auc decreases when the number of trees is between about 750 and about 1250. When the number of trees is greater than about 1250 roc_auc increases again.
+
+```{r}
+collect_metrics(boost_tune_res) %>% 
+  arrange(-mean)
+```
+The roc_auc of my best-performing boosted tree model on the folds is 0.6935841.
+
+#Exercise 10
+
+```{r,warning=FALSE}
+pruned_roc_auc <- collect_metrics(tune) %>% arrange(-mean)
+forest_roc_auc <- collect_metrics(tune_forest) %>% arrange(-mean)
+boost_roc_auc <- collect_metrics(boost_tune_res) %>% arrange(-mean)
+roc_auc_means <- c(pruned_roc_auc$mean[1], forest_roc_auc$mean[1], boost_roc_auc$mean[1])
+Models <- c("Pruned Tree", "Random Forest", "Boosted Tree")
+tibble(roc_auc = roc_auc_means, models = Models)
+```
+The random forest model performed the best on folds.
+
+```{r}
+best_boost_final <- select_best(boost_tune_res)
+best_boost_final_model <- finalize_workflow(boost_wf, best_boost_final)
+best_boost_final_model_fit <- fit(best_boost_final_model, data = Pokemon_train)
+```
+
+
+```{r,warning=FALSE}
+best_forest <- select_best(tune_forest)
+best_forest_model <- finalize_workflow(forest_wf, best_forest)
+best_forest_fit <- fit(best_forest_model, data = Pokemon_test)
+
+prediction <- augment(best_boost_final_model_fit , new_data = Pokemon_test) %>%
+  select(type_1, .pred_class, .pred_Bug,.pred_Fire, .pred_Grass, .pred_Normal, .pred_Psychic, .pred_Water)
+accuracy(prediction, type_1, .pred_class)
+
+prediction %>% 
+  roc_curve(type_1,.pred_Bug, .pred_Fire, .pred_Grass, .pred_Normal,.pred_Psychic, .pred_Water) %>% autoplot()
+
+
+prediction %>% 
+  conf_mat(type_1, .pred_class) %>% 
+  autoplot(type = "heatmap")
+```
+```{r}
+Water<-8/(2+3+8+3+3+7) 
+Psychic<-7/(1+2+2+7+4)
+Fire<-15/(4+2+15+2+9)
+Grass<-4/(3+1+4+1+2+2)
+Normal<-5/(5+2+1+1+4)
+Bug<-8/(8+2+5+2)
+rbind(Water,Psychic,Fire,Grass,Normal,Bug)
+```
+My model was most accurate at predicting Bug, and it was worst at Water and Grass
+
